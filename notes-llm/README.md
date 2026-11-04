@@ -15,3 +15,9 @@ Run on a COPY of the exports (the originals are OneDrive-synced), e.g. in PowerS
 - Output: `OUT/<notebook>/<title>-<hash>.md` plus `OUT/_attachments/...`.
 
 Next: index with Ollama (qwen2.5:14b + nomic-embed-text) via Open WebUI or AnythingLLM.
+
+## Pipeline
+1. `python convert_enex.py D:\notes-md <enex folders> --exclude PhotoAlbum`
+2. `pip install pypdf` then `python extract_pdfs.py D:\notes-md "<Old Evernote>" D:\notes-md\_attachments`
+3. `python bundle_notes.py D:\notes-md` -> `D:\notes-md\_bundles\*.md`
+4. Upload `_bundles` to an Open WebUI Knowledge collection (drag the folder in).
