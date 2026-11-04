@@ -92,13 +92,49 @@ def find_enex(inputs):
             yield p
 
 
-def convert_file(path, out, seen, mode, stats):
+def iter_notes(path, stats):
+    """Yield <note> elements. If the XML is malformed, recover note-by-note."""
+    try:
+        for _, el in ET.iterparse(path, events=("end",)):
+            if el.tag == "note":
+                yield el
+        return
+    except ET.ParseError as e:
+        stats["recovered_files"] += 1
+        print(f"  WARNING: malformed XML in {path.name} ({e}); recovering note by note", flush=True)
+    buf = ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        eof = False
+        while not eof:
+            chunk = f.read(4_000_000)
+            eof = not chunk
+            buf += chunk
+            while True:
+                a = buf.find("<note>")
+                if a < 0:
+                    buf = buf[-8:] if not eof else ""
+                    break
+                b = buf.find("</note>", a)
+                if b < 0:
+                    buf = buf[a:]
+                    break
+                c = buf.find("<note>", a + 6)
+                if 0 <= c < b:          # this note never closed: skip just it
+                    stats["bad_notes"] += 1
+                    buf = buf[c:]
+                    continue
+                piece, buf = buf[a:b + 7], buf[b + 7:]
+                try:
+                    yield ET.fromstring(piece)
+                except ET.ParseError:
+                    stats["bad_notes"] += 1
+
+
+def convert_file(path, out, seen, mode, stats, seen_fh):
     notebook = path.stem
     nb_dir = out / slug(notebook, 80)
     nb_dir.mkdir(parents=True, exist_ok=True)
-    for _, el in ET.iterparse(path, events=("end",)):
-        if el.tag != "note":
-            continue
+    for el in iter_notes(path, stats):
         title = (el.findtext("title") or "Untitled").strip()
         created = el.findtext("created") or ""
         updated = el.findtext("updated") or ""
@@ -140,6 +176,7 @@ def convert_file(path, out, seen, mode, stats):
             stats["duplicates"] += 1
             continue
         seen.add(key)
+        seen_fh.write(key + "\n"); seen_fh.flush()
 
         att_lines = []
         if resources and mode != "none":
@@ -177,12 +214,20 @@ def main():
     a = ap.parse_args()
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     excl = {e.lower() for e in a.exclude}
-    seen, stats = set(), {"notes": 0, "duplicates": 0, "attachments": 0}
-    for f in find_enex(a.inputs):
-        if f.stem.lower() in excl:
-            print(f"skip   {f.name}"); continue
-        print(f"convert {f}  ({f.stat().st_size/1e6:.0f} MB)", flush=True)
-        convert_file(f, out, seen, a.attachments, stats)
+    stats = {"notes": 0, "duplicates": 0, "attachments": 0, "recovered_files": 0,
+             "bad_notes": 0, "failed_files": 0}
+    seen_path = out / "_seen.txt"   # lets re-runs skip notes already converted
+    seen = set(seen_path.read_text().split()) if seen_path.exists() else set()
+    with open(seen_path, "a", encoding="utf-8") as seen_fh:
+        for f in find_enex(a.inputs):
+            if f.stem.lower() in excl:
+                print(f"skip   {f.name}"); continue
+            print(f"convert {f}  ({f.stat().st_size/1e6:.0f} MB)", flush=True)
+            try:
+                convert_file(f, out, seen, a.attachments, stats, seen_fh)
+            except Exception as e:
+                stats["failed_files"] += 1
+                print(f"  ERROR: {f.name}: {e!r} (continuing)", flush=True)
     print(json.dumps(stats))
 
 
