@@ -1,0 +1,13 @@
+# Personal notes data - NEVER commit (repo is public)
+*.enex
+notes-md/
+notes-out/
+**/_attachments/
+*.sqlite
+*.db
+chroma/
+vectorstore/
+open-webui-data/
+data/
+__pycache__/
+*.pyc
