@@ -1,0 +1,398 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head><body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+const W = 1080, H = 1920;
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let STATES = null; // injected
+
+// ---------- data ----------
+const STOPS = [
+  { name: "Wolski's Tavern", city: "Milwaukee", kind: "Tavern", lat: 43.0558, lon: -87.8935, emoji: "🏆",
+    line: "Stay till close and earn the famous “I Closed Wolski's” sticker." },
+  { name: "New Glarus Brewing", city: "New Glarus", kind: "Brewery", lat: 42.8122, lon: -89.6280, emoji: "🐄",
+    line: "Spotted Cow at the source — you can only get it in Wisconsin." },
+  { name: "The Old Fashioned", city: "Madison", kind: "Tavern & supper club", lat: 43.0749, lon: -89.3836, emoji: "🍊",
+    line: "Brandy Old Fashioneds and cheese curds on Capitol Square." },
+  { name: "The Bodega Brew Pub", city: "La Crosse", kind: "Brew pub", lat: 43.8128, lon: -91.2515, emoji: "🍺",
+    line: "A downtown beer-lover’s institution on the Mississippi." },
+  { name: "The Joynt", city: "Eau Claire", kind: "Jazz dive", lat: 44.8095, lon: -91.4985, emoji: "🎷",
+    line: "Legendary jazz-loving dive bar on Water Street." },
+  { name: "Moccasin Bar", city: "Hayward", kind: "Northwoods bar", lat: 46.0130, lon: -91.4846, emoji: "🦌",
+    line: "Taxidermy dioramas and a cold one, deep in the Northwoods." },
+  { name: "Bayside Tavern", city: "Fish Creek", kind: "Door County tavern", lat: 45.1286, lon: -87.2445, emoji: "☕",
+    line: "Finish in Door County with the famous Coffee Special." },
+];
+// bend per leg (fraction of leg length, sign picks side)
+const BEND = [0.10, -0.18, 0.14, -0.16, 0.12, 0.10];
+
+const CONTEXT = [
+  { n: "Green Bay", lat: 44.5133, lon: -88.0133 },
+  { n: "Wausau", lat: 44.9591, lon: -89.6301 },
+  { n: "Superior", lat: 46.7208, lon: -92.1041 },
+  { n: "Oshkosh", lat: 44.0247, lon: -88.5426 },
+  { n: "Stevens Point", lat: 44.5236, lon: -89.5746 },
+  { n: "Kenosha", lat: 42.5847, lon: -87.8212 },
+];
+const WATER_LABELS = [
+  { n: "Lake Michigan", lat: 43.9, lon: -87.05, rot: -1.45 },
+  { n: "Lake Superior", lat: 47.05, lon: -90.2, rot: 0 },
+  { n: "Mississippi River", lat: 43.25, lon: -91.32, rot: -1.25, small: true },
+];
+
+// ---------- palette ----------
+const C = {
+  bg0: '#07111f', bg1: '#0d1f36', water: '#0b1a2e', grid: 'rgba(120,170,230,0.05)',
+  nbr: '#141d2c', nbrLine: '#24314a',
+  wi0: '#262b42', wi1: '#1d2236', wiLine: 'rgba(255,184,64,0.75)',
+  gold: '#FFB833', goldHot: '#FFE29A', cream: '#FFF4E0', muted: 'rgba(255,244,224,0.55)',
+  card: 'rgba(14,20,34,0.88)', cardLine: 'rgba(255,184,51,0.35)', red: '#E8573C'
+};
+
+// ---------- projection ----------
+const D2R = Math.PI / 180;
+const mx = lon => lon * D2R;
+const my = lat => Math.log(Math.tan(Math.PI / 4 + lat * D2R / 2));
+let cam = { cx: 0, cy: 0, s: 1, fy: H / 2 };
+const sx = x => (x - cam.cx) * cam.s + W / 2;
+const sy = y => (cam.cy - y) * cam.s + cam.fy;
+
+// ---------- easing ----------
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const eio = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const eout = t => 1 - Math.pow(1 - t, 3);
+const eback = t => { const c1 = 1.9, c3 = c1 + 1; return 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2); };
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+
+// ---------- route geometry ----------
+const P = STOPS.map(s => ({ x: mx(s.lon), y: my(s.lat) }));
+const LEGS = [];
+for (let i = 1; i < P.length; i++) {
+  const a = P[i - 1], b = P[i];
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+  const nx = -dy / len, ny = dx / len, k = BEND[i - 1] * len;
+  const c = { x: (a.x + b.x) / 2 + nx * k, y: (a.y + b.y) / 2 + ny * k };
+  const pts = [], cum = [0];
+  const N = 120;
+  for (let j = 0; j <= N; j++) {
+    const t = j / N, u = 1 - t;
+    pts.push({ x: u * u * a.x + 2 * u * t * c.x + t * t * b.x, y: u * u * a.y + 2 * u * t * c.y + t * t * b.y });
+    if (j) cum.push(cum[j - 1] + Math.hypot(pts[j].x - pts[j - 1].x, pts[j].y - pts[j - 1].y));
+  }
+  LEGS.push({ pts, cum, total: cum[N] });
+}
+function legAt(leg, p) { // point + partial polyline at arc-length fraction p
+  const target = p * leg.total; const out = [leg.pts[0]];
+  for (let j = 1; j < leg.pts.length; j++) {
+    if (leg.cum[j] <= target) { out.push(leg.pts[j]); continue; }
+    const f = (target - leg.cum[j - 1]) / (leg.cum[j] - leg.cum[j - 1] || 1);
+    const q = { x: lerp(leg.pts[j - 1].x, leg.pts[j].x, f), y: lerp(leg.pts[j - 1].y, leg.pts[j].y, f) };
+    out.push(q); return { head: q, poly: out };
+  }
+  return { head: leg.pts[leg.pts.length - 1], poly: out };
+}
+
+// ---------- timeline ----------
+const T_INTRO = 3.0, HOLD = 2.0, LEG = 2.4, OUT_MOVE = 1.4, OUT_HOLD = 3.6;
+const ARR = STOPS.map((_, i) => i === 0 ? T_INTRO : T_INTRO + HOLD + (i - 1) * (LEG + HOLD) + LEG);
+const T_END_STOPS = ARR[ARR.length - 1] + HOLD;
+const DURATION = T_END_STOPS + OUT_MOVE + OUT_HOLD;
+
+const WI_C = { x: mx(-89.85), y: my(44.78) };
+const CAM_INTRO = { cx: WI_C.x, cy: WI_C.y, s: 8700, fy: 1130 };
+const CAM_OUTRO = { cx: WI_C.x, cy: WI_C.y, s: 7700, fy: 660 };
+const ZS = 15500, FY = 760;
+const camAt = p => ({ cx: p.x, cy: p.y, s: ZS, fy: FY });
+function mixCam(a, b, t) {
+  return { cx: lerp(a.cx, b.cx, t), cy: lerp(a.cy, b.cy, t), s: Math.exp(lerp(Math.log(a.s), Math.log(b.s), t)), fy: lerp(a.fy, b.fy, t) };
+}
+
+function state(t) {
+  // returns {phase, i, p}
+  if (t < ARR[0]) return { phase: 'intro' };
+  for (let i = 0; i < STOPS.length; i++) {
+    if (t < ARR[i] + HOLD) return { phase: 'hold', i, h: t - ARR[i] };
+    if (i + 1 < STOPS.length && t < ARR[i + 1]) return { phase: 'leg', i: i + 1, p: (t - (ARR[i] + HOLD)) / LEG };
+  }
+  return { phase: 'outro', o: t - T_END_STOPS };
+}
+
+function cameraFor(t, st) {
+  if (st.phase === 'intro') {
+    const push = { ...CAM_INTRO, s: CAM_INTRO.s * (0.96 + 0.04 * eout(seg(t, 0, 2))) };
+    return mixCam(push, camAt(P[0]), eio(seg(t, 2.0, ARR[0])));
+  }
+  if (st.phase === 'hold') return camAt(P[st.i]);
+  if (st.phase === 'leg') {
+    const leg = LEGS[st.i - 1], p = eio(st.p);
+    const head = legAt(leg, p).head;
+    const k = clamp(leg.total * ZS / 1100, 0, 0.75);
+    return { cx: head.x, cy: head.y, s: ZS / (1 + k * Math.sin(Math.PI * p)), fy: FY };
+  }
+  return mixCam(camAt(P[P.length - 1]), CAM_OUTRO, eio(seg(st.o, 0, OUT_MOVE)));
+}
+
+// ---------- drawing helpers ----------
+function pathRings(polys) {
+  ctx.beginPath();
+  for (const poly of polys) for (const ring of poly) {
+    for (let k = 0; k < ring.length; k++) {
+      const X = sx(mx(ring[k][0])), Y = sy(my(ring[k][1]));
+      k ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y);
+    }
+    ctx.closePath();
+  }
+}
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function font(w, px, fam = 'Inter') { ctx.font = `${w} ${px}px "${fam}", "Noto Color Emoji", sans-serif`; }
+function wrap(text, maxW) {
+  const words = text.split(' '), lines = []; let cur = '';
+  for (const w of words) { const tryL = cur ? cur + ' ' + w : w; if (ctx.measureText(tryL).width > maxW && cur) { lines.push(cur); cur = w; } else cur = tryL; }
+  if (cur) lines.push(cur); return lines;
+}
+function spaced(text, x, y, sp) { // letter-spaced text, left aligned
+  const a = ctx.textAlign; ctx.textAlign = 'left';
+  for (const ch of text) { ctx.fillText(ch, x, y); x += ctx.measureText(ch).width + sp; }
+  ctx.textAlign = a; return x;
+}
+function spacedW(text, sp) { let w = 0; for (const ch of text) w += ctx.measureText(ch).width + sp; return w - sp; }
+
+// ---------- scene ----------
+function drawMap(t) {
+  // background / water
+  const g = ctx.createRadialGradient(W / 2, H * 0.42, 100, W / 2, H * 0.45, H * 0.85);
+  g.addColorStop(0, C.bg1); g.addColorStop(1, C.bg0);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // graticule
+  ctx.strokeStyle = C.grid; ctx.lineWidth = 1.5;
+  for (let lon = -100; lon <= -80; lon += 0.5) { ctx.beginPath(); ctx.moveTo(sx(mx(lon)), 0); ctx.lineTo(sx(mx(lon)), H); ctx.stroke(); }
+  for (let lat = 38; lat <= 52; lat += 0.5) { ctx.beginPath(); ctx.moveTo(0, sy(my(lat))); ctx.lineTo(W, sy(my(lat))); ctx.stroke(); }
+
+  // neighbours
+  for (const k of ['MN', 'IA', 'IL', 'MI', 'IN']) {
+    pathRings(STATES[k]); ctx.fillStyle = C.nbr; ctx.fill();
+    ctx.strokeStyle = C.nbrLine; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // Wisconsin
+  pathRings(STATES.WI);
+  const wg = ctx.createLinearGradient(0, sy(my(47.1)), 0, sy(my(42.5)));
+  wg.addColorStop(0, C.wi0); wg.addColorStop(1, C.wi1);
+  ctx.fillStyle = wg; ctx.fill();
+  ctx.save(); ctx.shadowColor = 'rgba(255,170,40,0.55)'; ctx.shadowBlur = 22;
+  ctx.strokeStyle = C.wiLine; ctx.lineWidth = 3.5; ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore();
+
+  // water labels
+  ctx.save(); ctx.fillStyle = 'rgba(140,185,240,0.38)'; ctx.textAlign = 'center';
+  for (const L of WATER_LABELS) {
+    ctx.save(); ctx.translate(sx(mx(L.lon)), sy(my(L.lat))); ctx.rotate(L.rot);
+    ctx.font = `italic 500 ${L.small ? 22 : 30}px "Inter", sans-serif`;
+    const s = L.n.toUpperCase(); const sp = L.small ? 3 : 6; spaced(s, -spacedW(s, sp) / 2, 0, sp); ctx.restore();
+  }
+  ctx.restore();
+
+  // context towns
+  font(500, 24); ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  for (const c of CONTEXT) {
+    const X = sx(mx(c.lon)), Y = sy(my(c.lat));
+    ctx.fillStyle = 'rgba(255,244,224,0.32)'; ctx.beginPath(); ctx.arc(X, Y, 4.5, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,244,224,0.36)'; ctx.fillText(c.n, X + 12, Y);
+  }
+}
+
+function strokeRoute(poly, alpha = 1) {
+  if (poly.length < 2) return;
+  ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.globalAlpha = alpha;
+  ctx.beginPath(); poly.forEach((q, j) => j ? ctx.lineTo(sx(q.x), sy(q.y)) : ctx.moveTo(sx(q.x), sy(q.y)));
+  ctx.shadowColor = 'rgba(255,170,40,0.9)'; ctx.shadowBlur = 26;
+  ctx.strokeStyle = C.gold; ctx.lineWidth = 11; ctx.stroke();
+  ctx.shadowBlur = 0; ctx.strokeStyle = C.goldHot; ctx.lineWidth = 3.5; ctx.stroke();
+  ctx.restore();
+}
+
+function drawRoute(t, st) {
+  // upcoming stops: ghost dashes for the planned route
+  ctx.save(); ctx.setLineDash([2, 18]); ctx.lineCap = 'round'; ctx.strokeStyle = 'rgba(255,214,140,0.30)'; ctx.lineWidth = 6;
+  for (const leg of LEGS) { ctx.beginPath(); leg.pts.forEach((q, j) => j ? ctx.lineTo(sx(q.x), sy(q.y)) : ctx.moveTo(sx(q.x), sy(q.y))); ctx.stroke(); }
+  ctx.restore();
+
+  let doneLegs = 0, head = null;
+  if (st.phase === 'hold') doneLegs = st.i;
+  else if (st.phase === 'leg') doneLegs = st.i - 1;
+  else if (st.phase === 'outro') doneLegs = LEGS.length;
+  for (let i = 0; i < doneLegs; i++) strokeRoute(LEGS[i].pts);
+  if (st.phase === 'leg') {
+    const r = legAt(LEGS[st.i - 1], eio(st.p)); strokeRoute(r.poly); head = r.head;
+  }
+  return head;
+}
+
+function drawMarkers(t, st) {
+  const arrived = st.phase === 'intro' ? -1 : st.phase === 'hold' ? st.i : st.phase === 'leg' ? st.i - 1 : STOPS.length - 1;
+  STOPS.forEach((s, i) => {
+    const X = sx(P[i].x), Y = sy(P[i].y);
+    if (i > arrived) { // upcoming
+      ctx.save(); ctx.strokeStyle = 'rgba(255,214,140,0.45)'; ctx.lineWidth = 3; ctx.fillStyle = 'rgba(10,18,30,0.8)';
+      ctx.beginPath(); ctx.arc(X, Y, 11, 0, 7); ctx.fill(); ctx.stroke(); ctx.restore(); return;
+    }
+    const pop = eback(clamp((t - ARR[i]) / 0.5));
+    const r = Math.max(0, 27 * pop);
+    const isCur = st.phase === 'hold' && st.i === i;
+    if (isCur) { // pulse rings
+      for (let k = 0; k < 2; k++) {
+        const ph = ((t - ARR[i]) * 0.9 + k * 0.5) % 1;
+        ctx.strokeStyle = `rgba(255,184,51,${0.6 * (1 - ph)})`; ctx.lineWidth = 4;
+        ctx.beginPath(); ctx.arc(X, Y, 30 + ph * 70, 0, 7); ctx.stroke();
+      }
+    }
+    ctx.save(); ctx.shadowColor = 'rgba(0,0,0,0.6)'; ctx.shadowBlur = 14;
+    ctx.fillStyle = C.gold; ctx.beginPath(); ctx.arc(X, Y, r, 0, 7); ctx.fill(); ctx.restore();
+    ctx.strokeStyle = '#1a1206'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(X, Y, Math.max(0, r - 5), 0, 7); ctx.stroke();
+    if (pop > 0.4) {
+      ctx.fillStyle = '#1a1206'; font(900, 28 * pop, 'Inter Display'); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(String(i + 1), X, Y + 1);
+    }
+  });
+}
+
+function drawHead(t, head) {
+  if (!head) return;
+  const X = sx(head.x), Y = sy(head.y);
+  ctx.save(); ctx.fillStyle = 'rgba(255,200,90,0.25)'; ctx.beginPath(); ctx.arc(X, Y, 44, 0, 7); ctx.fill();
+  ctx.fillStyle = C.cream; ctx.beginPath(); ctx.arc(X, Y, 34, 0, 7); ctx.fill();
+  font(400, 40); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.translate(X, Y + 2); ctx.rotate(Math.sin(t * 9) * 0.12); ctx.fillText('🍺', 0, 0); ctx.restore();
+}
+
+function drawHeader(t, st) {
+  // top scrim
+  const g = ctx.createLinearGradient(0, 0, 0, 330); g.addColorStop(0, 'rgba(5,10,20,0.92)'); g.addColorStop(1, 'rgba(5,10,20,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 330);
+
+  if (st.phase === 'intro') {
+    const a = eout(seg(t, 0.15, 0.9)), b = eout(seg(t, 0.45, 1.2)), fade = 1 - eio(seg(t, 2.1, 2.8));
+    ctx.save(); ctx.globalAlpha = fade; ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+    ctx.fillStyle = C.gold; font(700, 30);
+    const k = 'THE ULTIMATE'; ctx.globalAlpha = fade * a; spaced(k, W / 2 - spacedW(k, 10) / 2, 205 - 20 * (1 - a), 10);
+    ctx.fillStyle = C.cream; font(900, 128, 'Inter Display'); ctx.globalAlpha = fade * a;
+    ctx.fillText('Wisconsin', W / 2, 335 - 30 * (1 - a));
+    font(900, 128, 'Inter Display'); ctx.fillStyle = C.gold; ctx.globalAlpha = fade * b;
+    ctx.fillText('Bar Crawl', W / 2, 465 - 30 * (1 - b));
+    ctx.restore();
+    // bottom tagline
+    const c2 = eout(seg(t, 0.9, 1.6));
+    ctx.save(); ctx.globalAlpha = fade * c2; ctx.textAlign = 'center'; ctx.fillStyle = C.cream; font(600, 40);
+    ctx.fillText('7 legendary stops · 1 road trip', W / 2, 1745 + 20 * (1 - c2));
+    ctx.fillStyle = C.muted; font(500, 30); ctx.fillText('Milwaukee → Door County', W / 2, 1800 + 20 * (1 - c2));
+    ctx.restore();
+    return;
+  }
+
+  // compact header with progress
+  const a = st.phase === 'outro' ? 1 : eout(seg(t, ARR[0] - 0.4, ARR[0] + 0.3));
+  ctx.save(); ctx.globalAlpha = a; ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.gold; font(700, 26); spaced('WISCONSIN', 64, 118, 8);
+  ctx.fillStyle = C.cream; font(900, 64, 'Inter Display'); ctx.fillText('Bar Crawl', 60, 186);
+  // progress pills
+  const arrived = st.phase === 'hold' ? st.i : st.phase === 'leg' ? st.i - 1 : STOPS.length - 1;
+  const n = STOPS.length, pw = 46, gap = 12, x0 = W - 64 - n * pw - (n - 1) * gap, y0 = 150;
+  for (let i = 0; i < n; i++) {
+    let fill = i <= arrived ? 1 : 0;
+    if (st.phase === 'leg' && i === st.i) fill = eio(st.p);
+    rr(x0 + i * (pw + gap), y0, pw, 10, 5); ctx.fillStyle = 'rgba(255,244,224,0.18)'; ctx.fill();
+    if (fill > 0) { rr(x0 + i * (pw + gap), y0, pw * fill, 10, 5); ctx.fillStyle = C.gold; ctx.fill(); }
+  }
+  ctx.textAlign = 'right'; ctx.fillStyle = C.muted; font(600, 26);
+  const label = st.phase === 'outro' ? 'ROUTE COMPLETE' : st.phase === 'leg' ? `NEXT: STOP ${st.i + 1}` : `STOP ${st.i + 1} OF ${n}`;
+  const lw = spacedW(label, 3); spaced(label, W - 64 - lw, 128, 3);
+  ctx.restore();
+}
+
+function drawCard(t, st) {
+  let i, k;
+  if (st.phase === 'hold') { i = st.i; k = eout(seg(st.h, 0.15, 0.65)); const out = eio(seg(st.h, HOLD - 0.3, HOLD)); k *= 1 - out * (i === STOPS.length - 1 ? 1 : 1); }
+  else return;
+  if (k <= 0.001) return;
+  const s = STOPS[i];
+  const x = 56, w = W - 112, h = 400, y = 1390 + (1 - k) * 160;
+  ctx.save(); ctx.globalAlpha = k;
+  ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 50; ctx.shadowOffsetY = 18;
+  rr(x, y, w, h, 40); ctx.fillStyle = C.card; ctx.fill(); ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = C.cardLine; ctx.lineWidth = 2; ctx.stroke();
+  // number badge
+  ctx.fillStyle = C.gold; rr(x + 44, y + 44, 92, 92, 26); ctx.fill();
+  ctx.fillStyle = '#1a1206'; font(900, 54, 'Inter Display'); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(String(i + 1), x + 90, y + 92);
+  // emoji
+  font(400, 64); ctx.fillText(s.emoji, x + w - 90, y + 92);
+  // kicker
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.gold; font(700, 26);
+  spaced(`${s.kind.toUpperCase()}  ·  ${s.city.toUpperCase()}`, x + 164, y + 82, 3);
+  // name
+  ctx.fillStyle = C.cream; font(900, 60, 'Inter Display');
+  let nameSize = 60; while (ctx.measureText(s.name).width > w - 164 - 150 && nameSize > 40) { nameSize -= 2; font(900, nameSize, 'Inter Display'); }
+  ctx.fillText(s.name, x + 164, y + 142);
+  // line
+  ctx.fillStyle = 'rgba(255,244,224,0.82)'; font(500, 38);
+  wrap(s.line, w - 88).forEach((L, j) => ctx.fillText(L, x + 44, y + 236 + j * 52));
+  ctx.restore();
+}
+
+function drawOutro(t, st) {
+  if (st.phase !== 'outro') return;
+  const o = st.o;
+  const k = eout(seg(o, 0.5, 1.3));
+  const x = 56, w = W - 112, y = 1135 + (1 - k) * 120, h = 650;
+  ctx.save(); ctx.globalAlpha = k;
+  ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 50; ctx.shadowOffsetY = 18;
+  rr(x, y, w, h, 40); ctx.fillStyle = C.card; ctx.fill(); ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = C.cardLine; ctx.lineWidth = 2; ctx.stroke();
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  STOPS.forEach((s, i) => {
+    const kk = eout(seg(o, 0.7 + i * 0.12, 1.2 + i * 0.12));
+    const yy = y + 60 + i * 66; ctx.globalAlpha = k * kk;
+    ctx.fillStyle = C.gold; ctx.beginPath(); ctx.arc(x + 66, yy, 22, 0, 7); ctx.fill();
+    ctx.fillStyle = '#1a1206'; font(900, 24, 'Inter Display'); ctx.textAlign = 'center'; ctx.fillText(String(i + 1), x + 66, yy + 1);
+    ctx.textAlign = 'left'; ctx.fillStyle = C.cream; font(800, 36, 'Inter Display'); ctx.fillText(s.name, x + 110 + 20 * (1 - kk), yy);
+    ctx.textAlign = 'right'; ctx.fillStyle = C.muted; font(500, 30); ctx.fillText(s.city, x + w - 44, yy);
+    ctx.textAlign = 'left';
+  });
+  const kc = eout(seg(o, 1.9, 2.5)); ctx.globalAlpha = k * kc;
+  ctx.strokeStyle = 'rgba(255,244,224,0.12)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x + 44, y + 530); ctx.lineTo(x + w - 44, y + 530); ctx.stroke();
+  ctx.textAlign = 'center'; ctx.fillStyle = C.gold; font(800, 38, 'Inter Display');
+  ctx.fillText('Save this for your next road trip 🍻', W / 2, y + 585);
+  ctx.restore();
+  // responsibility line
+  ctx.save(); ctx.globalAlpha = kc; ctx.textAlign = 'center'; ctx.fillStyle = C.muted; font(500, 26);
+  ctx.fillText('Drink responsibly — always have a designated driver 🚗', W / 2, 1850); ctx.restore();
+}
+
+function render(t) {
+  const st = state(t);
+  cam = cameraFor(t, st);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.setLineDash([]);
+  drawMap(t);
+  const head = drawRoute(t, st);
+  drawMarkers(t, st);
+  drawHead(t, head);
+  // bottom scrim when card/outro shown
+  const g = ctx.createLinearGradient(0, H - 700, 0, H); g.addColorStop(0, 'rgba(5,10,20,0)'); g.addColorStop(1, 'rgba(5,10,20,0.85)');
+  ctx.fillStyle = g; ctx.fillRect(0, H - 700, W, 700);
+  drawHeader(t, st);
+  drawCard(t, st);
+  drawOutro(t, st);
+  // fade in/out
+  const f = Math.max(1 - seg(t, 0, 0.4), seg(t, DURATION - 0.5, DURATION));
+  if (f > 0) { ctx.fillStyle = `rgba(0,0,0,${f})`; ctx.fillRect(0, 0, W, H); }
+}
+window.__reel = { render, DURATION, setStates: s => { STATES = s; } };
+</script>
+</body></html>
