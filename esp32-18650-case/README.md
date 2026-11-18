@@ -13,6 +13,8 @@ Use it as a small USB power bank or as a power source for an ESP32.
 | `stl/tray.stl` | Bottom part that holds the PCB, ready to print |
 | `stl/lid.stl` | Top part that covers the battery, already flipped onto its roof for printing |
 | `stl/plate.stl` | Both parts on one plate |
+| `step/*.step` | STEP solids for Onshape / Fusion / FreeCAD (see below) |
+| `case_step.py` | CadQuery script that generates the STEP files |
 
 Outside size with the default settings: **111 × 34.3 × 32.5 mm**.
 
@@ -61,6 +63,34 @@ print the lid.
 
 To export after editing: `openscad -o tray.stl -D 'part="tray"' case.scad` (or `lid` /
 `plate`). Use `part="assembly"` to preview the case with stand-in parts.
+
+## Editing in Onshape (or Fusion 360 / FreeCAD)
+
+Use the **STEP** files in `step/`, not the STLs. STL is a triangle mesh, and Onshape can't
+edit a mesh as a solid. STEP gives you real faces, holes and fillets.
+
+| File | Use |
+|---|---|
+| `step/case_assembled.step` | **Start here.** Tray + lid as two separate parts, in assembled position |
+| `step/tray.step`, `step/lid.step` | Each part on its own |
+
+1. In Onshape, go to **Create → Import** (or drag the file in) and pick
+   `case_assembled.step`.
+2. Open the Part Studio that the import creates. You'll get two parts, *tray* and *lid*,
+   and you can edit them with:
+   - **Move face** (and Offset face): widen or shift a port opening, change wall
+     thickness or height, move a screw post. This is the most useful tool for imported parts.
+   - **Delete face**: remove a feature completely, e.g. select the faces of the vents or
+     LED holes and delete them so the floor heals over.
+   - Sketch on any face, then **Extrude** to add or remove material (new holes, text,
+     mounting tabs, an ESP32 bay). **Fillet / Chamfer** work on any edge.
+3. Export each part as STL (right-click the part → Export) and slice as usual. Flip the
+   lid onto its roof for printing.
+
+Imported STEP files have **no feature history**, so you can't change a number and have
+everything update. For big parametric changes (different board size, taller battery),
+edit the values at the top of `case_step.py` (they match `case.scad`), run
+`pip install cadquery && python3 case_step.py`, and re-import the new STEP.
 
 ## Print settings (PETG)
 
