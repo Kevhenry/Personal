@@ -1,0 +1,335 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>html,body{margin:0;background:#000}canvas{display:block}</style>
+</head><body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<script>
+const W = 1080, H = 1920;
+const ctx = document.getElementById('c').getContext('2d');
+const C = {
+  bg0: '#07111f', bg1: '#0d1f36', grid: 'rgba(120,170,230,0.05)',
+  nbr: '#141d2c', nbrLine: '#24314a', wi0: '#262b42', wi1: '#1d2236', wiLine: 'rgba(255,184,64,0.75)',
+  road: ['rgba(170,190,230,0.30)', 'rgba(170,190,230,0.24)', 'rgba(170,190,230,0.17)', 'rgba(170,190,230,0.10)'],
+  gold: '#FFB833', goldHot: '#FFE29A', cream: '#FFF4E0', muted: 'rgba(255,244,224,0.58)',
+  card: 'rgba(14,20,34,0.88)', cardLine: 'rgba(255,184,51,0.35)'
+};
+
+// ---------- utils ----------
+const clamp = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const eio = t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+const eout = t => 1 - Math.pow(1 - t, 3);
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const fmt = n => Math.round(n).toLocaleString('en-US');
+function bsearch(arr, v, lo = 0, hi = arr.length - 1) { // last index with arr[i] <= v
+  while (lo < hi) { const m = (lo + hi + 1) >> 1; if (arr[m] <= v) lo = m; else hi = m - 1; }
+  return lo;
+}
+function rr(x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function font(w, px, fam = 'Inter') { ctx.font = `${w} ${px}px "${fam}", "Noto Color Emoji", sans-serif`; }
+function spaced(text, x, y, sp) { const a = ctx.textAlign; ctx.textAlign = 'left'; for (const ch of text) { ctx.fillText(ch, x, y); x += ctx.measureText(ch).width + sp; } ctx.textAlign = a; return x; }
+function spacedW(text, sp) { let w = 0; for (const ch of text) w += ctx.measureText(ch).width + sp; return w - sp; }
+function fitText(text, maxW, weight, size, fam, min = 26) {
+  font(weight, size, fam); while (ctx.measureText(text).width > maxW && size > min) { size -= 2; font(weight, size, fam); }
+  if (ctx.measureText(text).width > maxW) { while (text.length > 3 && ctx.measureText(text + '…').width > maxW) text = text.slice(0, -1); text += '…'; }
+  return text;
+}
+
+// ---------- projection ----------
+const D2R = Math.PI / 180;
+const mx = lon => lon * D2R, my = lat => Math.log(Math.tan(Math.PI / 4 + lat * D2R / 2));
+let cam = { cx: 0, cy: 0, s: 1, fy: H / 2 };
+const sx = x => (x - cam.cx) * cam.s + W / 2, sy = y => (cam.cy - y) * cam.s + cam.fy;
+const mixCam = (a, b, t) => ({ cx: lerp(a.cx, b.cx, t), cy: lerp(a.cy, b.cy, t), s: Math.exp(lerp(Math.log(a.s), Math.log(b.s), t)), fy: lerp(a.fy, b.fy, t) });
+
+// ---------- data + timeline ----------
+let D, R, B, N, STATES_M, ROADS, LEG_W, TL, SAMPLES, CAMS, DURATION;
+const T_INTRO = 3.6, T_IN = 1.2, T_OUTMOVE = 1.6, T_OUTHOLD = 5.4;
+let T_DRIVE = 60, T0;
+const LOD_TOL = [5e-7, 4e-6, 2e-5, 8e-5];
+const CAM_FULL = { cx: mx(-89.85), cy: my(44.78), s: 8700, fy: 1110 };
+const CAM_OUT = { cx: mx(-89.85), cy: my(44.78), s: 7700, fy: 690 };
+const SR = 20; // camera samples per second
+
+function setData(data, opts = {}) {
+  D = data; N = D.bars.x.length;
+  R = { x: Float64Array.from(D.route.x), y: Float64Array.from(D.route.y), d: Float64Array.from(D.route.d), t: Float64Array.from(D.route.t), lods: D.route.lods.map(a => Int32Array.from(a)) };
+  B = { x: D.bars.x, y: D.bars.y, name: D.bars.name, city: D.bars.city, stop: D.bars.stop };
+  // states -> mercator rings
+  STATES_M = {};
+  for (const k in D.states) STATES_M[k] = D.states[k].map(poly => poly.map(ring => ring.map(([lo, la]) => [mx(lo), my(la)])));
+  ROADS = D.roads;
+  T_DRIVE = opts.drive || clamp(12 + N * 0.016, 16, 62);
+  T0 = T_INTRO + T_IN;
+  DURATION = T0 + T_DRIVE + T_OUTMOVE + T_OUTHOLD;
+  // leg weights: half by count of bars, half by distance, so cities and long hauls both get screen time
+  const total = R.d[R.d.length - 1] || 1;
+  LEG_W = new Float64Array(N); LEG_W[0] = 0;
+  for (let k = 1; k < N; k++) {
+    const dl = R.d[B.stop[k]] - R.d[B.stop[k - 1]];
+    LEG_W[k] = LEG_W[k - 1] + 0.5 / (N - 1) + 0.5 * dl / total;
+  }
+  for (let k = 0; k < N; k++) LEG_W[k] /= LEG_W[N - 1];
+  // camera samples
+  const ns = Math.ceil(T_DRIVE * SR) + 1;
+  SAMPLES = [];
+  for (let j = 0; j < ns; j++) SAMPLES.push(headAt(driveU(j / SR)));
+  const raw = SAMPLES.map((_, j) => {
+    let sw = 0, xm = 0, ym = 0;
+    const win = 1.8 * SR;
+    for (let q = Math.max(0, j - win); q <= Math.min(ns - 1, j + win); q++) { const w = Math.exp(-0.5 * ((q - j) / (win / 2)) ** 2); sw += w; xm += w * SAMPLES[q].x; ym += w * SAMPLES[q].y; }
+    xm /= sw; ym /= sw;
+    let v = 0;
+    for (let q = Math.max(0, j - win); q <= Math.min(ns - 1, j + win); q++) { const w = Math.exp(-0.5 * ((q - j) / (win / 2)) ** 2); v += w * ((SAMPLES[q].x - xm) ** 2 + (SAMPLES[q].y - ym) ** 2); }
+    const spread = Math.sqrt(v / sw);
+    return { x: xm, y: ym, ls: Math.log(clamp(230 / (spread + 1e-9), 9000, 85000)) };
+  });
+  CAMS = raw.map((_, j) => { // smooth zoom further
+    let sw = 0, ls = 0; const win = 2.5 * SR;
+    for (let q = Math.max(0, j - win); q <= Math.min(ns - 1, j + win); q++) { const w = Math.exp(-0.5 * ((q - j) / (win / 2)) ** 2); sw += w; ls += w * raw[q].ls; }
+    return { cx: raw[j].x, cy: raw[j].y, s: Math.exp(ls / sw), fy: 980 };
+  });
+  // visit time of each bar (for pop rings)
+  TL = new Float64Array(N); let k = 0;
+  for (let j = 0; j < ns; j++) while (k <= SAMPLES[j].k && k < N) TL[k++] = T0 + j / SR;
+  for (; k < N; k++) TL[k] = T0 + T_DRIVE;
+  return DURATION;
+}
+
+function driveU(tau) { // 0..T_DRIVE -> 0..1 with gentle ease at both ends
+  const r = 1.5, T = T_DRIVE, v = 1 / (T - r);
+  if (tau <= 0) return 0; if (tau >= T) return 1;
+  if (tau < r) return v * tau * tau / (2 * r);
+  if (tau > T - r) return 1 - v * (T - tau) ** 2 / (2 * r);
+  return v * (r / 2 + (tau - r));
+}
+function headAt(u) {
+  const k = Math.min(bsearch(LEG_W, u), N - 1);
+  if (k >= N - 1) { const i = B.stop[N - 1]; return { k: N - 1, i, f: 0, x: R.x[i], y: R.y[i], d: R.d[i], t: R.t[i] }; }
+  const f = (u - LEG_W[k]) / (LEG_W[k + 1] - LEG_W[k] || 1);
+  const a = B.stop[k], b = B.stop[k + 1];
+  const dd = R.d[a] + f * (R.d[b] - R.d[a]);
+  const i = Math.min(bsearch(R.d, dd, a, b), b - 1 < a ? a : b - 1);
+  const segL = R.d[i + 1] - R.d[i]; const g = segL > 0 ? clamp((dd - R.d[i]) / segL) : 0;
+  return { k, i, f: g, x: lerp(R.x[i], R.x[i + 1], g), y: lerp(R.y[i], R.y[i + 1], g), d: dd, t: lerp(R.t[i], R.t[i + 1], g) };
+}
+function driveCam(tau) {
+  const j = clamp(tau * SR, 0, CAMS.length - 1), j0 = Math.floor(j), j1 = Math.min(j0 + 1, CAMS.length - 1);
+  return mixCam(CAMS[j0], CAMS[j1], j - j0);
+}
+
+function state(t) {
+  if (t < T_INTRO + T_IN) return { phase: 'intro' };
+  if (t < T0 + T_DRIVE) return { phase: 'drive', tau: t - T0 };
+  return { phase: 'outro', o: t - T0 - T_DRIVE };
+}
+function cameraFor(t, st) {
+  if (st.phase === 'intro') {
+    const push = { ...CAM_FULL, s: CAM_FULL.s * (0.96 + 0.04 * eout(seg(t, 0, 2.5))) };
+    return mixCam(push, driveCam(0), eio(seg(t, T_INTRO, T_INTRO + T_IN)));
+  }
+  if (st.phase === 'drive') return driveCam(st.tau);
+  return mixCam(driveCam(T_DRIVE), CAM_OUT, eio(seg(st.o, 0, T_OUTMOVE)));
+}
+
+// ---------- drawing ----------
+function ringsPath(polys) {
+  ctx.beginPath();
+  for (const poly of polys) for (const ring of poly) { ring.forEach(([x, y], k) => k ? ctx.lineTo(sx(x), sy(y)) : ctx.moveTo(sx(x), sy(y))); ctx.closePath(); }
+}
+function drawMap() {
+  const g = ctx.createRadialGradient(W / 2, H * 0.42, 100, W / 2, H * 0.45, H * 0.85);
+  g.addColorStop(0, C.bg1); g.addColorStop(1, C.bg0); ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+  for (const k of ['MN', 'IA', 'IL', 'MI', 'IN']) { if (!STATES_M[k]) continue; ringsPath(STATES_M[k]); ctx.fillStyle = C.nbr; ctx.fill(); ctx.strokeStyle = C.nbrLine; ctx.lineWidth = 2; ctx.stroke(); }
+  ringsPath(STATES_M.WI);
+  const wg = ctx.createLinearGradient(0, sy(my(47.1)), 0, sy(my(42.5))); wg.addColorStop(0, C.wi0); wg.addColorStop(1, C.wi1);
+  ctx.fillStyle = wg; ctx.fill();
+  ctx.save(); ctx.shadowColor = 'rgba(255,170,40,0.5)'; ctx.shadowBlur = 20; ctx.strokeStyle = C.wiLine; ctx.lineWidth = 3; ctx.lineJoin = 'round'; ctx.stroke(); ctx.restore();
+  // roads (major classes always, minor ones fade in when zoomed)
+  const zoomK = clamp((cam.s - 12000) / 30000);
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  for (let cls = 0; cls < 4; cls++) {
+    const a = cls < 2 ? 1 : cls === 2 ? 0.5 + 0.5 * zoomK : zoomK; if (a <= 0.02) continue;
+    ctx.globalAlpha = a; ctx.strokeStyle = C.road[cls]; ctx.lineWidth = [3, 2.4, 1.8, 1.4][cls] * clamp(cam.s / 20000, 0.7, 1.6);
+    ctx.beginPath();
+    for (const [c, f] of ROADS) { if (c !== cls) continue; for (let q = 0; q < f.length; q += 2) { const X = sx(f[q]), Y = sy(f[q + 1]); q ? ctx.lineTo(X, Y) : ctx.moveTo(X, Y); } }
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function lodFor() { let L = 0; for (let l = 0; l < LOD_TOL.length; l++) if (LOD_TOL[l] * cam.s <= 1.0) L = l; return L; }
+function tracePrefix(h, fromD = -1) { // path along the route up to the head (optionally only from distance fromD)
+  const L = lodFor();
+  ctx.beginPath();
+  let started = false;
+  const put = (x, y) => { const X = sx(x), Y = sy(y); if (started) ctx.lineTo(X, Y); else { ctx.moveTo(X, Y); started = true; } };
+  if (L === 0 || fromD >= 0) {
+    const i0 = fromD >= 0 ? bsearch(R.d, fromD) : 0;
+    for (let i = i0; i <= h.i; i++) put(R.x[i], R.y[i]);
+  } else {
+    const idx = R.lods[L - 1]; const cut = bsearch(idx, h.i);
+    for (let j = 0; j <= cut; j++) put(R.x[idx[j]], R.y[idx[j]]);
+    for (let i = idx[cut] + 1; i <= h.i; i++) put(R.x[i], R.y[i]);
+  }
+  put(h.x, h.y);
+}
+function drawRoute(h) {
+  if (!h) return;
+  ctx.save(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const wk = clamp(cam.s / 25000, 0.55, 1.4);
+  tracePrefix(h);
+  ctx.strokeStyle = 'rgba(255,184,51,0.22)'; ctx.lineWidth = 12 * wk; ctx.stroke();
+  ctx.strokeStyle = C.gold; ctx.lineWidth = 4.2 * wk; ctx.stroke();
+  // hot comet tail
+  tracePrefix(h, Math.max(0, h.d - 9000 * 25000 / cam.s));
+  ctx.shadowColor = 'rgba(255,190,60,1)'; ctx.shadowBlur = 24; ctx.strokeStyle = C.goldHot; ctx.lineWidth = 5 * wk; ctx.stroke();
+  ctx.restore();
+}
+function drawBars(t, visited, revealK = 1) {
+  const r = clamp(cam.s / 30000 * 3.2, 1.7, 6);
+  // unvisited
+  ctx.fillStyle = 'rgba(255,244,224,0.42)'; ctx.beginPath();
+  const n = Math.floor(N * revealK);
+  for (let k = visited + 1; k < N; k++) {
+    if (revealK < 1 && ((k * 2654435761) >>> 0) % N >= n) continue;
+    const X = sx(B.x[k]), Y = sy(B.y[k]); if (X < -10 || X > W + 10 || Y < -10 || Y > H + 10) continue;
+    ctx.moveTo(X + r, Y); ctx.arc(X, Y, r, 0, 6.2832);
+  }
+  ctx.fill();
+  // visited
+  ctx.fillStyle = C.gold; ctx.beginPath();
+  for (let k = 0; k <= visited; k++) {
+    const X = sx(B.x[k]), Y = sy(B.y[k]); if (X < -10 || X > W + 10 || Y < -10 || Y > H + 10) continue;
+    ctx.moveTo(X + r * 1.25, Y); ctx.arc(X, Y, r * 1.25, 0, 6.2832);
+  }
+  ctx.fill();
+  // pop rings on just-visited bars
+  ctx.lineWidth = 3;
+  for (let k = visited; k >= 0 && t - TL[k] < 0.6; k--) {
+    const a = (t - TL[k]) / 0.6; if (a < 0) continue;
+    const X = sx(B.x[k]), Y = sy(B.y[k]); if (X < -60 || X > W + 60 || Y < -60 || Y > H + 60) continue;
+    ctx.strokeStyle = `rgba(255,214,120,${0.8 * (1 - a)})`; ctx.beginPath(); ctx.arc(X, Y, r + 6 + 34 * eout(a), 0, 6.2832); ctx.stroke();
+  }
+}
+function drawHead(t, h) {
+  const X = sx(h.x), Y = sy(h.y);
+  ctx.save(); ctx.fillStyle = 'rgba(255,200,90,0.25)'; ctx.beginPath(); ctx.arc(X, Y, 42, 0, 7); ctx.fill();
+  ctx.fillStyle = C.cream; ctx.beginPath(); ctx.arc(X, Y, 32, 0, 7); ctx.fill();
+  font(400, 38); ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.translate(X, Y + 2); ctx.rotate(Math.sin(t * 9) * 0.12); ctx.fillText('🍺', 0, 0); ctx.restore();
+}
+
+function drawHUD(t, st, h) {
+  const g = ctx.createLinearGradient(0, 0, 0, 420); g.addColorStop(0, 'rgba(5,10,20,0.95)'); g.addColorStop(0.7, 'rgba(5,10,20,0.6)'); g.addColorStop(1, 'rgba(5,10,20,0)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, 420);
+  const a = st.phase === 'intro' ? eout(seg(t, T_INTRO, T_INTRO + T_IN)) : 1;
+  if (a <= 0) return;
+  ctx.save(); ctx.globalAlpha = a; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.gold; font(700, 26); ctx.textAlign = 'left'; spaced('EVERY BAR IN WISCONSIN', 64, 112, 7);
+  const visited = h ? h.k + 1 : 0;
+  ctx.fillStyle = C.cream; font(900, 104, 'Inter Display'); ctx.textAlign = 'left';
+  const num = fmt(visited); ctx.fillText(num, 58, 222);
+  const nw = ctx.measureText(num).width;
+  ctx.fillStyle = C.muted; font(600, 34); ctx.fillText(`of ${fmt(N)} bars`, 72 + nw, 220);
+  // right stats
+  ctx.textAlign = 'right';
+  ctx.fillStyle = C.cream; font(800, 46, 'Inter Display'); ctx.fillText(`${fmt((h ? h.d : 0) / 1609.34)} mi`, W - 64, 168);
+  ctx.fillStyle = C.muted; font(600, 30); ctx.fillText(`${fmt((h ? h.t : 0) / 3600)} hrs behind the wheel`, W - 64, 214);
+  // progress bar
+  rr(64, 256, W - 128, 10, 5); ctx.fillStyle = 'rgba(255,244,224,0.16)'; ctx.fill();
+  const p = h ? (h.k + h.f * 0) / Math.max(1, N - 1) : 0;
+  if (p > 0) { rr(64, 256, Math.max(10, (W - 128) * clamp(p)), 10, 5); ctx.fillStyle = C.gold; ctx.fill(); }
+  ctx.restore();
+}
+
+function drawNowCard(t, st) {
+  if (st.phase !== 'drive' && !(st.phase === 'outro' && st.o < 0.6) && !(st.phase === 'intro' && t > T_INTRO)) return;
+  const a = st.phase === 'intro' ? eout(seg(t, T_INTRO + 0.3, T_INTRO + T_IN)) : st.phase === 'outro' ? 1 - seg(st.o, 0, 0.6) : 1;
+  // throttle the name so it is readable in dense cities
+  const step = 0.4, tq = st.phase === 'drive' ? Math.floor(st.tau / step) * step : 0;
+  const k = st.phase === 'outro' ? N - 1 : headAt(driveU(tq)).k;
+  const x = 56, w = W - 112, h = 190, y = 1650;
+  ctx.save(); ctx.globalAlpha = a;
+  ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 40; ctx.shadowOffsetY = 14;
+  rr(x, y, w, h, 36); ctx.fillStyle = C.card; ctx.fill(); ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = C.cardLine; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = C.gold; rr(x + 36, y + 40, 110, 110, 28); ctx.fill();
+  ctx.fillStyle = '#1a1206'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const lbl = '#' + fmt(k + 1); const nm = fitText(lbl, 96, 900, 40, 'Inter Display', 22); ctx.fillText(nm, x + 91, y + 96);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.gold; font(700, 24); spaced('NOW POURING AT', x + 176, y + 74, 4);
+  ctx.fillStyle = C.cream; const name = fitText(B.name[k], w - 176 - 40, 900, 50, 'Inter Display', 32); ctx.fillText(name, x + 176, y + 128);
+  ctx.fillStyle = C.muted; font(500, 30); ctx.fillText(fitText(B.city[k] ? B.city[k] + ', WI' : 'Wisconsin', w - 216, 500, 30), x + 176, y + 168);
+  ctx.restore();
+}
+
+function drawIntro(t) {
+  const fade = 1 - eio(seg(t, T_INTRO - 0.5, T_INTRO + 0.3));
+  if (fade <= 0) return;
+  const a = eout(seg(t, 0.15, 0.9)), b = eout(seg(t, 0.45, 1.2)), c = eout(seg(t, 0.9, 1.6));
+  ctx.save(); ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = C.gold; font(700, 30); ctx.globalAlpha = fade * a;
+  const k = 'ONE ROAD TRIP TO'; spaced(k, W / 2 - spacedW(k, 9) / 2, 200 - 20 * (1 - a), 9);
+  ctx.fillStyle = C.cream; font(900, 118, 'Inter Display'); ctx.fillText('Every Bar in', W / 2, 330 - 30 * (1 - a));
+  ctx.fillStyle = C.gold; ctx.globalAlpha = fade * b; ctx.fillText('Wisconsin', W / 2, 458 - 30 * (1 - b));
+  ctx.globalAlpha = fade * c; ctx.fillStyle = C.cream; font(600, 40);
+  ctx.fillText(`${fmt(N)} bars · real roads · fastest route`, W / 2, 1745 + 20 * (1 - c));
+  ctx.fillStyle = C.muted; font(500, 30); ctx.fillText('every dot is a bar', W / 2, 1800 + 20 * (1 - c));
+  ctx.restore();
+}
+
+function drawOutro(t, st) {
+  if (st.phase !== 'outro') return;
+  const o = st.o, k = eout(seg(o, 0.6, 1.4));
+  const x = 56, w = W - 112, y = 1180, h = 560;
+  ctx.save(); ctx.globalAlpha = k;
+  ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 50; ctx.shadowOffsetY = 18;
+  rr(x, y + (1 - k) * 100, w, h, 40); ctx.fillStyle = C.card; ctx.fill(); ctx.shadowColor = 'transparent';
+  ctx.strokeStyle = C.cardLine; ctx.lineWidth = 2; ctx.stroke();
+  const yy = y + (1 - k) * 100;
+  const stats = [[fmt(N), 'bars'], [fmt(D.total_m / 1609.34), 'miles'], [fmt(D.total_s / 3600), 'hours driving']];
+  stats.forEach(([v, l], i) => {
+    const kk = eout(seg(o, 0.9 + i * 0.25, 1.5 + i * 0.25)); ctx.globalAlpha = k * kk;
+    const cx = x + w * (i + 0.5) / 3;
+    ctx.textAlign = 'center'; ctx.fillStyle = C.cream; font(900, 76, 'Inter Display'); ctx.fillText(fitText(v, w / 3 - 24, 900, 76, 'Inter Display', 40), cx, yy + 150);
+    ctx.fillStyle = C.muted; font(600, 30); ctx.fillText(l, cx, yy + 198);
+  });
+  const kd = eout(seg(o, 1.8, 2.4)); ctx.globalAlpha = k * kd;
+  ctx.textAlign = 'center'; ctx.fillStyle = C.gold; font(800, 40, 'Inter Display');
+  const days = D.total_s / 86400, dTxt = days < 10 ? days.toFixed(1) : fmt(days);
+  ctx.fillText(`≈ ${dTxt} ${dTxt === '1.0' ? 'day' : 'days'} nonstop at the wheel`, W / 2, yy + 300);
+  ctx.strokeStyle = 'rgba(255,244,224,0.12)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x + 44, yy + 360); ctx.lineTo(x + w - 44, yy + 360); ctx.stroke();
+  ctx.fillStyle = C.cream; font(700, 36, 'Inter Display'); ctx.fillText('Pick a stop. Bring a designated driver 🚗', W / 2, yy + 430);
+  ctx.fillStyle = C.muted; font(500, 24); ctx.fillText('Bar data © OpenStreetMap contributors · Routing: OSRM', W / 2, yy + 500);
+  ctx.restore();
+}
+
+function render(t) {
+  const st = state(t);
+  cam = cameraFor(t, st);
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.setLineDash([]);
+  drawMap();
+  let h = null;
+  if (st.phase === 'drive') h = headAt(driveU(st.tau));
+  else if (st.phase === 'outro') h = headAt(1);
+  if (h) drawRoute(h);
+  const reveal = st.phase === 'intro' ? eout(seg(t, 0.3, 2.6)) : 1;
+  drawBars(t, h ? h.k : -1, reveal);
+  if (st.phase === 'intro' && t > T_INTRO) drawHead(t, headAt(0));
+  if (st.phase === 'drive') drawHead(t, h);
+  const g = ctx.createLinearGradient(0, H - 560, 0, H); g.addColorStop(0, 'rgba(5,10,20,0)'); g.addColorStop(1, 'rgba(5,10,20,0.85)');
+  ctx.fillStyle = g; ctx.fillRect(0, H - 560, W, 560);
+  if (st.phase === 'intro') drawIntro(t);
+  drawHUD(t, st, h);
+  drawNowCard(t, st);
+  drawOutro(t, st);
+  const f = Math.max(1 - seg(t, 0, 0.4), seg(t, DURATION - 0.5, DURATION));
+  if (f > 0) { ctx.fillStyle = `rgba(0,0,0,${f})`; ctx.fillRect(0, 0, W, H); }
+}
+window.__reel = { render, setData };
+</script>
+</body></html>
