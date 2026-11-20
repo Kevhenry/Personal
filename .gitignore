@@ -11,3 +11,7 @@ open-webui-data/
 data/
 __pycache__/
 *.pyc
+
+# ESPHome garage door: secrets and build output
+garage-door/secrets.yaml
+.esphome/
